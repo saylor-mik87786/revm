@@ -516,9 +516,9 @@ impl BundleState {
         &self.state
     }
 
-    /// Checks whether bundle state is empty.
+    /// Is bundle state empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.state.is_empty()
     }
 
     /// Return number of changed accounts.
