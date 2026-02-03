@@ -306,6 +306,7 @@ impl GasParams {
         if spec.is_enabled_in(SpecId::PRAGUE) {
             table[GasId::tx_eip7702_per_empty_account_cost().as_usize()] =
                 eip7702::PER_EMPTY_ACCOUNT_COST;
+            table[GasId::tx_eip7702_per_auth_base_cost().as_usize()] = eip7702::PER_AUTH_BASE_COST;
 
             table[GasId::tx_floor_cost_per_token().as_usize()] = gas::TOTAL_COST_FLOOR_PER_TOKEN;
             table[GasId::tx_floor_cost_base_gas().as_usize()] = 21000;
@@ -640,6 +641,35 @@ impl GasParams {
         self.get(GasId::tx_eip7702_per_empty_account_cost())
     }
 
+    /// Used to calculate the eip7702 per auth base cost.
+    #[inline]
+    pub fn tx_eip7702_per_auth_base_cost(&self) -> u64 {
+        self.get(GasId::tx_eip7702_per_auth_base_cost())
+    }
+
+    /// Calculate the gas refund for EIP-7702 authorization.
+    ///
+    /// This is a helper method that calculates the refund amount when an authorization
+    /// is applied to an already existing (non-empty) account.
+    ///
+    /// The refund is: `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use revm_context_interface::cfg::gas_params::GasParams;
+    /// use primitives::hardfork::SpecId;
+    ///
+    /// let gas_params = GasParams::new_spec(SpecId::PRAGUE);
+    /// let refund = gas_params.tx_eip7702_auth_refund();
+    /// assert_eq!(refund, 25000 - 12500); // PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST
+    /// ```
+    #[inline]
+    pub fn tx_eip7702_auth_refund(&self) -> u64 {
+        self.tx_eip7702_per_empty_account_cost()
+            .saturating_sub(self.tx_eip7702_per_auth_base_cost())
+    }
+
     /// Used in [GasParams::initial_tx_gas] to calculate the token non zero byte multiplier.
     #[inline]
     pub fn tx_token_non_zero_byte_multiplier(&self) -> u64 {
@@ -864,6 +894,9 @@ impl GasId {
             x if x == Self::tx_eip7702_per_empty_account_cost().as_u8() => {
                 "tx_eip7702_per_empty_account_cost"
             }
+            x if x == Self::tx_eip7702_per_auth_base_cost().as_u8() => {
+                "tx_eip7702_per_auth_base_cost"
+            }
             x if x == Self::tx_token_non_zero_byte_multiplier().as_u8() => {
                 "tx_token_non_zero_byte_multiplier"
             }
@@ -927,6 +960,7 @@ impl GasId {
             "new_account_cost_for_selfdestruct" => Some(Self::new_account_cost_for_selfdestruct()),
             "code_deposit_cost" => Some(Self::code_deposit_cost()),
             "tx_eip7702_per_empty_account_cost" => Some(Self::tx_eip7702_per_empty_account_cost()),
+            "tx_eip7702_per_auth_base_cost" => Some(Self::tx_eip7702_per_auth_base_cost()),
             "tx_token_non_zero_byte_multiplier" => Some(Self::tx_token_non_zero_byte_multiplier()),
             "tx_token_cost" => Some(Self::tx_token_cost()),
             "tx_floor_cost_per_token" => Some(Self::tx_floor_cost_per_token()),
@@ -1134,6 +1168,11 @@ impl GasId {
     pub const fn sstore_reset_refund() -> GasId {
         Self::new(38)
     }
+
+    /// EIP-7702 PER_AUTH_BASE_COST gas
+    pub const fn tx_eip7702_per_auth_base_cost() -> GasId {
+        Self::new(39)
+    }
 }
 
 #[cfg(test)]
@@ -1176,11 +1215,11 @@ mod tests {
             "Not all unique names are resolvable via from_str"
         );
 
-        // We should have exactly 38 known GasIds (based on the indices 1-38 used)
+        // We should have exactly 39 known GasIds (based on the indices 1-39 used)
         assert_eq!(
             unique_names.len(),
-            38,
-            "Expected 38 unique GasIds, found {}",
+            39,
+            "Expected 39 unique GasIds, found {}",
             unique_names.len()
         );
     }
@@ -1222,5 +1261,34 @@ mod tests {
         // Test with pre-Berlin spec (should return 0)
         let gas_params_pre_berlin = GasParams::new_spec(SpecId::ISTANBUL);
         assert_eq!(gas_params_pre_berlin.tx_access_list_cost(10, 20), 0);
+    }
+
+    #[test]
+    fn test_tx_eip7702_auth_refund() {
+        use primitives::eip7702;
+
+        // Test with Prague spec (when EIP-7702 was introduced)
+        let gas_params = GasParams::new_spec(SpecId::PRAGUE);
+
+        // Verify individual costs
+        assert_eq!(
+            gas_params.tx_eip7702_per_empty_account_cost(),
+            eip7702::PER_EMPTY_ACCOUNT_COST
+        );
+        assert_eq!(
+            gas_params.tx_eip7702_per_auth_base_cost(),
+            eip7702::PER_AUTH_BASE_COST
+        );
+
+        // Verify refund calculation
+        let expected_refund = eip7702::PER_EMPTY_ACCOUNT_COST - eip7702::PER_AUTH_BASE_COST;
+        assert_eq!(gas_params.tx_eip7702_auth_refund(), expected_refund);
+        assert_eq!(gas_params.tx_eip7702_auth_refund(), 12500); // 25000 - 12500
+
+        // Test with pre-Prague spec (should return 0)
+        let gas_params_pre_prague = GasParams::new_spec(SpecId::CANCUN);
+        assert_eq!(gas_params_pre_prague.tx_eip7702_per_empty_account_cost(), 0);
+        assert_eq!(gas_params_pre_prague.tx_eip7702_per_auth_base_cost(), 0);
+        assert_eq!(gas_params_pre_prague.tx_eip7702_auth_refund(), 0);
     }
 }

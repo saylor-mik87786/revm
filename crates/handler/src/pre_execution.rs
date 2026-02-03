@@ -11,7 +11,7 @@ use context_interface::{
     Block, Cfg, ContextTr, Database,
 };
 use core::cmp::Ordering;
-use primitives::{eip7702, hardfork::SpecId, AddressMap, HashSet, StorageKey, U256};
+use primitives::{hardfork::SpecId, AddressMap, HashSet, StorageKey, U256};
 use state::AccountInfo;
 
 /// Loads and warms accounts for execution, including precompiles and access list.
@@ -182,7 +182,7 @@ pub fn validate_against_state_and_deduct_caller<
 /// Note that this function will do nothing if the transaction type is not EIP-7702.
 /// If you need to apply auth list for other transaction types, use [`apply_auth_list`] function.
 ///
-/// Internally uses [`apply_auth_list`] function.
+/// Internally uses [`apply_auth_list_with_gas_params`] function.
 #[inline]
 pub fn apply_eip7702_auth_list<
     CTX: ContextTr,
@@ -191,18 +191,24 @@ pub fn apply_eip7702_auth_list<
     context: &mut CTX,
 ) -> Result<u64, ERROR> {
     let chain_id = context.cfg().chain_id();
+    let gas_params = context.cfg().gas_params().clone();
     let (tx, journal) = context.tx_journal_mut();
 
     // Return if not EIP-7702 transaction.
     if tx.tx_type() != TransactionType::Eip7702 {
         return Ok(0);
     }
-    apply_auth_list(chain_id, tx.authorization_list(), journal)
+    apply_auth_list_with_gas_params(chain_id, tx.authorization_list(), journal, &gas_params)
 }
 
 /// Apply EIP-7702 style auth list and return number gas refund on already created accounts.
 ///
 /// It is more granular function from [`apply_eip7702_auth_list`] function as it takes only the list, journal and chain id.
+///
+/// # Note
+///
+/// This function uses default gas parameters from Prague spec. For custom gas parameters,
+/// use [`apply_auth_list_with_gas_params`].
 #[inline]
 pub fn apply_auth_list<
     JOURNAL: JournalTr,
@@ -212,6 +218,8 @@ pub fn apply_auth_list<
     auth_list: impl Iterator<Item = impl AuthorizationTr>,
     journal: &mut JOURNAL,
 ) -> Result<u64, ERROR> {
+    use primitives::eip7702;
+
     let mut refunded_accounts = 0;
     for authorization in auth_list {
         // 1. Verify the chain id is either 0 or the chain's current ID.
@@ -267,6 +275,77 @@ pub fn apply_auth_list<
 
     let refunded_gas =
         refunded_accounts * (eip7702::PER_EMPTY_ACCOUNT_COST - eip7702::PER_AUTH_BASE_COST);
+
+    Ok(refunded_gas)
+}
+
+/// Apply EIP-7702 style auth list with custom gas parameters and return number gas refund on already created accounts.
+///
+/// This is similar to [`apply_auth_list`] but allows specifying custom gas parameters for the refund calculation.
+#[inline]
+pub fn apply_auth_list_with_gas_params<
+    JOURNAL: JournalTr,
+    ERROR: From<InvalidTransaction> + From<<JOURNAL::Database as Database>::Error>,
+>(
+    chain_id: u64,
+    auth_list: impl Iterator<Item = impl AuthorizationTr>,
+    journal: &mut JOURNAL,
+    gas_params: &context_interface::cfg::GasParams,
+) -> Result<u64, ERROR> {
+    let mut refunded_accounts = 0;
+    for authorization in auth_list {
+        // 1. Verify the chain id is either 0 or the chain's current ID.
+        let auth_chain_id = authorization.chain_id();
+        if !auth_chain_id.is_zero() && auth_chain_id != U256::from(chain_id) {
+            continue;
+        }
+
+        // 2. Verify the `nonce` is less than `2**64 - 1`.
+        if authorization.nonce() == u64::MAX {
+            continue;
+        }
+
+        // recover authority and authorized addresses.
+        // 3. `authority = ecrecover(keccak(MAGIC || rlp([chain_id, address, nonce])), y_parity, r, s]`
+        let Some(authority) = authorization.authority() else {
+            continue;
+        };
+
+        // warm authority account and check nonce.
+        // 4. Add `authority` to `accessed_addresses` (as defined in [EIP-2929](./eip-2929.md).)
+        let mut authority_acc = journal.load_account_with_code_mut(authority)?;
+        let authority_acc_info = &authority_acc.account().info;
+
+        // 5. Verify the code of `authority` is either empty or already delegated.
+        if let Some(bytecode) = &authority_acc_info.code {
+            // if it is not empty and it is not eip7702
+            if !bytecode.is_empty() && !bytecode.is_eip7702() {
+                continue;
+            }
+        }
+
+        // 6. Verify the nonce of `authority` is equal to `nonce`. In case `authority` does not exist in the trie, verify that `nonce` is equal to `0`.
+        if authorization.nonce() != authority_acc_info.nonce {
+            continue;
+        }
+
+        // 7. Add `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` gas to the global refund counter if `authority` exists in the trie.
+        if !(authority_acc_info.is_empty()
+            && authority_acc
+                .account()
+                .is_loaded_as_not_existing_not_touched())
+        {
+            refunded_accounts += 1;
+        }
+
+        // 8. Set the code of `authority` to be `0xef0100 || address`. This is a delegation designation.
+        //  * As a special case, if `address` is `0x0000000000000000000000000000000000000000` do not write the designation.
+        //    Clear the accounts code and reset the account's code hash to the empty hash `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.
+        // 9. Increase the nonce of `authority` by one.
+        authority_acc.delegate(authorization.address());
+    }
+
+    let refunded_gas = refunded_accounts * gas_params.tx_eip7702_auth_refund();
 
     Ok(refunded_gas)
 }
